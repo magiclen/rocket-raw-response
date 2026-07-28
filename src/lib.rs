@@ -3,29 +3,89 @@
 
 This crate provides a response struct used for responding raw data.
 
-See `examples`.
+```rust
+use rocket::get;
+use rocket_raw_response::RawResponse;
+
+#[get("/")]
+fn index() -> RawResponse {
+    RawResponse::from_vec(b"Hello world!".to_vec()).file_name("hello.txt")
+}
+```
+
+The media type is guessed from the extension of the file name, but it can also be set explicitly.
+
+```rust
+use rocket::get;
+use rocket_raw_response::{RawResponse, mime};
+
+#[get("/")]
+fn index() -> RawResponse {
+    RawResponse::from_vec(b"a,b\n1,2\n".to_vec())
+        .file_name("report.csv")
+        .content_type(mime::TEXT_CSV)
+}
+```
+
+A file on disk is opened asynchronously, and both the file name and the media type default to what the path says.
+
+```rust
+use std::io;
+
+use rocket::get;
+use rocket_raw_response::RawResponse;
+
+#[get("/")]
+async fn index() -> io::Result<RawResponse> {
+    RawResponse::from_file("images/image.jpg").await
+}
+```
+
+An uploaded file can be sent straight back. Rocket drops the extension from `TempFile::name`, so this crate puts it back from the media type of the upload.
+
+```rust
+use rocket::{form::Form, fs::TempFile, post};
+use rocket_raw_response::RawResponsePro;
+
+#[post("/", data = "<file>")]
+fn echo(file: Form<TempFile<'_>>) -> RawResponsePro<'_> {
+    RawResponsePro::from_temp_file(file.into_inner())
+}
+```
+
+`attachment` asks the client to save the body instead of displaying it.
+
+```rust
+use rocket::get;
+use rocket_raw_response::RawResponse;
+
+#[get("/")]
+fn index() -> RawResponse {
+    RawResponse::from_vec(b"Hello world!".to_vec()).file_name("hello.txt").attachment()
+}
+```
 */
 
 pub extern crate mime;
-
-#[macro_use]
-extern crate educe;
+pub extern crate rocket;
 
 mod temp_file_async_reader;
 
 use std::{
+    borrow::Cow,
+    ffi::OsStr,
     io::{self, Cursor},
-    marker::Unpin,
     path::Path,
     sync::Arc,
 };
 
+use educe::Educe;
 use mime::Mime;
 use rocket::{
     fs::TempFile,
     http::Status,
     request::Request,
-    response::{self, Responder, Response},
+    response::{self, Builder, Responder, Response},
     tokio::{fs::File as AsyncFile, io::AsyncRead},
 };
 use temp_file_async_reader::TempFileAsyncReader;
@@ -33,8 +93,7 @@ use temp_file_async_reader::TempFileAsyncReader;
 #[derive(Educe)]
 #[educe(Debug)]
 enum RawResponseData<'o> {
-    Slice(&'o [u8]),
-    Vec(Vec<u8>),
+    Bytes(Cow<'o, [u8]>),
     Reader {
         #[educe(Debug(ignore))]
         data:           Box<dyn AsyncRead + Send + Unpin + 'o>,
@@ -44,237 +103,269 @@ enum RawResponseData<'o> {
     TempFile(Box<TempFile<'o>>),
 }
 
+/// A [`RawResponsePro`] that borrows nothing, which is what a route usually returns.
 pub type RawResponse = RawResponsePro<'static>;
 
+/// The responder that makes a client display the body as it is.
 #[derive(Debug)]
 pub struct RawResponsePro<'o> {
+    data:         RawResponseData<'o>,
     file_name:    Option<String>,
     content_type: Option<Mime>,
-    data:         RawResponseData<'o>,
+    inline:       bool,
 }
 
 impl<'o> RawResponsePro<'o> {
-    /// Create a `RawResponse` instance from a `&'o [u8]`.
-    pub fn from_slice<S: Into<String>>(
-        data: &'o [u8],
-        file_name: Option<S>,
-        content_type: Option<Mime>,
-    ) -> RawResponsePro<'o> {
-        let file_name = file_name.map(|file_name| file_name.into());
-
-        let data = RawResponseData::Slice(data);
-
+    #[inline]
+    fn new(data: RawResponseData<'o>) -> Self {
         RawResponsePro {
-            file_name,
-            content_type,
             data,
+            file_name: None,
+            content_type: None,
+            inline: true,
         }
+    }
+
+    /// Create a `RawResponse` instance from a `&'o [u8]`.
+    #[inline]
+    pub fn from_slice(data: &'o [u8]) -> Self {
+        Self::new(RawResponseData::Bytes(Cow::Borrowed(data)))
     }
 
     /// Create a `RawResponse` instance from a `Vec<u8>`.
-    pub fn from_vec<S: Into<String>>(
-        vec: Vec<u8>,
-        file_name: Option<S>,
-        content_type: Option<Mime>,
-    ) -> RawResponsePro<'o> {
-        let file_name = file_name.map(|file_name| file_name.into());
-
-        let data = RawResponseData::Vec(vec);
-
-        RawResponsePro {
-            file_name,
-            content_type,
-            data,
-        }
+    #[inline]
+    pub fn from_vec(vec: Vec<u8>) -> Self {
+        Self::new(RawResponseData::Bytes(Cow::Owned(vec)))
     }
 
-    /// Create a `RawResponse` instance from a reader.
-    pub fn from_reader<R: AsyncRead + Send + Unpin + 'o, S: Into<String>>(
-        reader: R,
-        file_name: Option<S>,
-        content_type: Option<Mime>,
-        content_length: Option<u64>,
-    ) -> RawResponsePro<'o> {
-        let file_name = file_name.map(|file_name| file_name.into());
-
-        let data = RawResponseData::Reader {
-            data: Box::new(reader),
-            content_length,
-        };
-
-        RawResponsePro {
-            file_name,
-            content_type,
-            data,
-        }
-    }
-
-    /// Create a `RawResponse` instance from a path of a file.
-    pub async fn from_file<P: Into<Arc<Path>>, S: Into<String>>(
-        path: P,
-        file_name: Option<S>,
-        content_type: Option<Mime>,
-    ) -> Result<RawResponsePro<'o>, io::Error> {
-        let path = path.into();
-
-        let file = AsyncFile::open(path.as_ref()).await?;
-
-        let file_name = file_name.map(|file_name| file_name.into());
-
-        let data = RawResponseData::File(path, file);
-
-        Ok(RawResponsePro {
-            file_name,
-            content_type,
-            data,
+    /// Create a `RawResponse` instance from a reader whose length is not known in advance, so no `Content-Length` header is sent.
+    #[inline]
+    pub fn from_reader<R: AsyncRead + Send + Unpin + 'o>(reader: R) -> Self {
+        Self::new(RawResponseData::Reader {
+            data:           Box::new(reader),
+            content_length: None,
         })
     }
 
+    /// Create a `RawResponse` instance from a reader whose length is already known, so a `Content-Length` header can be sent.
+    #[inline]
+    pub fn from_reader_sized<R: AsyncRead + Send + Unpin + 'o>(
+        reader: R,
+        content_length: u64,
+    ) -> Self {
+        Self::new(RawResponseData::Reader {
+            data:           Box::new(reader),
+            content_length: Some(content_length),
+        })
+    }
+
+    /// Create a `RawResponse` instance from a path of a file, which is opened right away.
+    pub async fn from_file<P: AsRef<Path>>(path: P) -> Result<Self, io::Error> {
+        let path = path.as_ref();
+
+        let file = AsyncFile::open(path).await?;
+
+        Ok(Self::new(RawResponseData::File(Arc::from(path), file)))
+    }
+
     /// Create a `RawResponse` instance from a `TempFile`.
-    pub fn from_temp_file<S: Into<String>>(
-        temp_file: TempFile<'o>,
-        file_name: Option<S>,
-        content_type: Option<Mime>,
-    ) -> RawResponsePro<'o> {
-        let file_name = file_name.map(|file_name| file_name.into());
+    #[inline]
+    pub fn from_temp_file(temp_file: TempFile<'o>) -> Self {
+        Self::new(RawResponseData::TempFile(Box::new(temp_file)))
+    }
 
-        let data = RawResponseData::TempFile(Box::new(temp_file));
+    /// Set the file name the client should display the body as. An empty name sends no name at all.
+    #[inline]
+    #[must_use]
+    pub fn file_name<S: Into<String>>(mut self, file_name: S) -> Self {
+        self.file_name = Some(file_name.into());
 
-        RawResponsePro {
-            file_name,
-            content_type,
-            data,
+        self
+    }
+
+    /// Set the media type of the body, which otherwise is guessed from the file name.
+    #[inline]
+    #[must_use]
+    pub fn content_type(mut self, content_type: Mime) -> Self {
+        self.content_type = Some(content_type);
+
+        self
+    }
+
+    /// Send `attachment` instead of `inline`, which asks the client to save the body rather than to display it.
+    #[inline]
+    #[must_use]
+    pub fn attachment(mut self) -> Self {
+        self.inline = false;
+
+        self
+    }
+}
+
+const HEX_DIGITS: [u8; 16] = *b"0123456789ABCDEF";
+
+/// Percent-encode `s` with the `attr-char` set of RFC 8187, which is the only set the `filename*` parameter accepts.
+fn encode_attr_char_to_string(s: &str, output: &mut String) {
+    for b in s.bytes() {
+        if b.is_ascii_alphanumeric()
+            || matches!(
+                b,
+                b'!' | b'#' | b'$' | b'&' | b'+' | b'-' | b'.' | b'^' | b'_' | b'`' | b'|' | b'~'
+            )
+        {
+            output.push(b as char);
+        } else {
+            output.push('%');
+            output.push(HEX_DIGITS[usize::from(b >> 4)] as char);
+            output.push(HEX_DIGITS[usize::from(b & 0x0F)] as char);
         }
     }
 }
 
-macro_rules! file_name {
-    ($s:expr, $res:expr) => {
-        if let Some(file_name) = $s.file_name {
-            if file_name.is_empty() {
-                $res.raw_header("Content-Disposition", "inline");
-            } else {
-                let mut v = String::from("inline; filename*=UTF-8''");
-
-                url_escape::encode_component_to_string(file_name, &mut v);
-
-                $res.raw_header("Content-Disposition", v);
-            }
+/// Write `s` as the quoted-string of the `filename` parameter, replacing everything a quoted-string cannot hold with `_`.
+fn encode_ascii_fallback_to_string(s: &str, output: &mut String) {
+    for c in s.chars() {
+        if c == ' ' || (c.is_ascii_graphic() && c != '"' && c != '\\') {
+            output.push(c);
+        } else {
+            output.push('_');
         }
-    };
+    }
 }
 
-macro_rules! content_type {
-    ($s:expr, $res:expr) => {
-        if let Some(content_type) = $s.content_type {
-            $res.raw_header("Content-Type", content_type.to_string());
-        }
-    };
+const FILE_NAME_PREFIX: &str = "; filename=\"";
+const FILE_NAME_STAR_PREFIX: &str = "\"; filename*=UTF-8''";
+
+/// Write the `Content-Disposition` header, carrying the file name both as an ASCII fallback and as RFC 8187 UTF-8.
+fn write_content_disposition(response: &mut Builder<'_>, inline: bool, file_name: Option<&str>) {
+    let disposition = if inline { "inline" } else { "attachment" };
+
+    let file_name = file_name.filter(|file_name| !file_name.is_empty());
+
+    let mut v = String::with_capacity(match file_name {
+        // The ASCII fallback keeps the length of the name, the RFC 8187 copy triples it at worst.
+        Some(file_name) => {
+            disposition.len()
+                + FILE_NAME_PREFIX.len()
+                + FILE_NAME_STAR_PREFIX.len()
+                + file_name.len() * 4
+        },
+        None => disposition.len(),
+    });
+
+    v.push_str(disposition);
+
+    if let Some(file_name) = file_name {
+        v.push_str(FILE_NAME_PREFIX);
+        encode_ascii_fallback_to_string(file_name, &mut v);
+        v.push_str(FILE_NAME_STAR_PREFIX);
+        encode_attr_char_to_string(file_name, &mut v);
+    }
+
+    response.raw_header("Content-Disposition", v);
+}
+
+/// Write the `Content-Type` header, preferring the explicit media type, then the one the source carries, then a guess made from the file name or from the path of the source.
+fn write_content_type(
+    response: &mut Builder<'_>,
+    content_type: Option<Mime>,
+    data: &RawResponseData<'_>,
+    file_name: Option<&str>,
+) {
+    if let Some(content_type) = content_type {
+        response.raw_header("Content-Type", content_type.to_string());
+
+        return;
+    }
+
+    if let RawResponseData::TempFile(temp_file) = data
+        && let Some(content_type) = temp_file.content_type()
+        // `application/octet-stream` is what a client sends when it does not know either, so a guess does better.
+        && !content_type.is_binary()
+    {
+        response.raw_header("Content-Type", content_type.to_string());
+
+        return;
+    }
+
+    let extension = file_name.map(Path::new).and_then(Path::extension).or_else(|| match data {
+        // The file name may have been replaced with one that carries no extension, but the path still knows what the file is.
+        RawResponseData::File(path, _) => path.extension(),
+        _ => None,
+    });
+
+    // Nothing says what the body is. Send no media type at all and let the client sniff it, rather than send `application/octet-stream` and make the client save a body that is meant to be displayed.
+    if let Some(extension) = extension.and_then(OsStr::to_str) {
+        let content_type = mime_guess::from_ext(extension).first_or_octet_stream();
+
+        response.raw_header("Content-Type", content_type.to_string());
+    }
+}
+
+/// Rocket strips every extension from `TempFile::name`, so append back the one the client sent, or the one that belongs to the uploaded media type.
+fn temp_file_name(temp_file: &TempFile<'_>) -> Option<String> {
+    let name = temp_file.name()?;
+
+    // Only the extension is read from the raw name, so any path a client may have sent is still dropped.
+    let raw_extension = temp_file.raw_name().and_then(|raw_name| {
+        Path::new(raw_name.dangerous_unsafe_unsanitized_raw().as_str()).extension()?.to_str()
+    });
+
+    if let Some(extension) = raw_extension {
+        return Some(format!("{name}.{extension}"));
+    }
+
+    match temp_file.content_type().and_then(|content_type| content_type.extension()) {
+        Some(extension) => Some(format!("{name}.{extension}")),
+        None => Some(String::from(name)),
+    }
+}
+
+/// The file name the source suggests, used when the caller sets none.
+fn default_file_name(data: &RawResponseData<'_>) -> Option<String> {
+    match data {
+        RawResponseData::File(path, _) => {
+            path.file_name().map(|file_name| file_name.to_string_lossy().into_owned())
+        },
+        RawResponseData::TempFile(temp_file) => temp_file_name(temp_file),
+        _ => None,
+    }
 }
 
 impl<'r, 'o: 'r> Responder<'r, 'o> for RawResponsePro<'o> {
     fn respond_to(self, _: &'r Request<'_>) -> response::Result<'o> {
+        let RawResponsePro {
+            data,
+            file_name,
+            content_type,
+            inline,
+        } = self;
+
         let mut response = Response::build();
 
-        match self.data {
-            RawResponseData::Slice(data) => {
-                file_name!(self, response);
-                content_type!(self, response);
+        let file_name = file_name.or_else(|| default_file_name(&data));
 
-                response.sized_body(data.len(), Cursor::new(data));
-            },
-            RawResponseData::Vec(data) => {
-                file_name!(self, response);
-                content_type!(self, response);
+        write_content_disposition(&mut response, inline, file_name.as_deref());
+        write_content_type(&mut response, content_type, &data, file_name.as_deref());
 
+        match data {
+            RawResponseData::Bytes(data) => {
                 response.sized_body(data.len(), Cursor::new(data));
             },
             RawResponseData::Reader {
                 data,
                 content_length,
             } => {
-                file_name!(self, response);
-                content_type!(self, response);
-
                 if let Some(content_length) = content_length {
                     response.raw_header("Content-Length", content_length.to_string());
                 }
 
                 response.streamed_body(data);
             },
-            RawResponseData::File(path, file) => {
-                if let Some(file_name) = self.file_name {
-                    if file_name.is_empty() {
-                        response.raw_header("Content-Disposition", "inline");
-                    } else {
-                        let mut v = String::from("inline; filename*=UTF-8''");
-
-                        url_escape::encode_component_to_string(file_name, &mut v);
-
-                        response.raw_header("Content-Disposition", v);
-                    }
-                } else if let Some(file_name) =
-                    path.file_name().map(|file_name| file_name.to_string_lossy())
-                {
-                    let mut v = String::from("inline; filename*=UTF-8''");
-
-                    url_escape::encode_component_to_string(file_name, &mut v);
-
-                    response.raw_header("Content-Disposition", v);
-                } else {
-                    response.raw_header("Content-Disposition", "inline");
-                }
-
-                if let Some(content_type) = self.content_type {
-                    response.raw_header("Content-Type", content_type.to_string());
-                } else if let Some(extension) = path.extension() {
-                    if let Some(extension) = extension.to_str() {
-                        let content_type = mime_guess::from_ext(extension).first_or_octet_stream();
-
-                        response.raw_header("Content-Type", content_type.to_string());
-                    }
-                }
-
+            RawResponseData::File(_, file) => {
                 response.sized_body(None, file);
             },
             RawResponseData::TempFile(file) => {
-                if let Some(file_name) = self.file_name {
-                    if file_name.is_empty() {
-                        response.raw_header("Content-Disposition", "inline");
-                    } else {
-                        let mut v = String::from("inline; filename*=UTF-8''");
-
-                        url_escape::encode_component_to_string(file_name, &mut v);
-
-                        response.raw_header("Content-Disposition", v);
-                    }
-                } else if let Some(file_name) = file.name() {
-                    if file_name.is_empty() {
-                        response.raw_header("Content-Disposition", "inline");
-                    } else {
-                        let mut v = String::from("attachment; filename*=UTF-8''");
-
-                        url_escape::encode_component_to_string(file_name, &mut v);
-
-                        response.raw_header("Content-Disposition", v);
-                    }
-                } else {
-                    response.raw_header("Content-Disposition", "inline");
-                }
-
-                if let Some(content_type) = self.content_type {
-                    response.raw_header("Content-Type", content_type.to_string());
-                } else if let Some(content_type) = file.content_type() {
-                    response.raw_header("Content-Type", content_type.to_string());
-                } else if let Some(extension) = file.name().map(Path::new).and_then(Path::extension)
-                {
-                    if let Some(extension) = extension.to_str() {
-                        let content_type = mime_guess::from_ext(extension).first_or_octet_stream();
-
-                        response.raw_header("Content-Type", content_type.to_string());
-                    }
-                }
-
                 response.raw_header("Content-Length", file.len().to_string());
 
                 response.streamed_body(
