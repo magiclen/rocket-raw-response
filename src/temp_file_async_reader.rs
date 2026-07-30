@@ -1,6 +1,6 @@
 use std::{
     fs::File,
-    io::{self},
+    io,
     pin::Pin,
     task::{Context, Poll},
 };

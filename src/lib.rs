@@ -61,7 +61,9 @@ use rocket_raw_response::RawResponse;
 
 #[get("/")]
 fn index() -> RawResponse {
-    RawResponse::from_vec(b"Hello world!".to_vec()).file_name("hello.txt").attachment()
+    RawResponse::from_vec(b"Hello world!".to_vec())
+        .file_name("hello.txt")
+        .attachment()
 }
 ```
 */
@@ -76,7 +78,6 @@ use std::{
     ffi::OsStr,
     io::{self, Cursor},
     path::Path,
-    sync::Arc,
 };
 
 use educe::Educe;
@@ -99,7 +100,7 @@ enum RawResponseData<'o> {
         data:           Box<dyn AsyncRead + Send + Unpin + 'o>,
         content_length: Option<u64>,
     },
-    File(Arc<Path>, AsyncFile),
+    File(Box<Path>, AsyncFile),
     TempFile(Box<TempFile<'o>>),
 }
 
@@ -165,7 +166,7 @@ impl<'o> RawResponsePro<'o> {
 
         let file = AsyncFile::open(path).await?;
 
-        Ok(Self::new(RawResponseData::File(Arc::from(path), file)))
+        Ok(Self::new(RawResponseData::File(Box::from(path), file)))
     }
 
     /// Create a `RawResponse` instance from a `TempFile`.

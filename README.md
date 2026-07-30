@@ -63,7 +63,9 @@ use rocket_raw_response::RawResponse;
 
 #[get("/")]
 fn index() -> RawResponse {
-    RawResponse::from_vec(b"Hello world!".to_vec()).file_name("hello.txt").attachment()
+    RawResponse::from_vec(b"Hello world!".to_vec())
+        .file_name("hello.txt")
+        .attachment()
 }
 ```
 
