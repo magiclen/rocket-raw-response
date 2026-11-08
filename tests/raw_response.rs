@@ -62,16 +62,21 @@ fn apostrophe_page() -> RawResponse {
     RawResponse::from_vec(b"Hello world!".to_vec()).file_name("it's.txt")
 }
 
-#[get("/file")]
-async fn file_page() -> Result<RawResponse, Status> {
+#[get("/file?<file_name>")]
+async fn file_page(file_name: Option<&str>) -> Result<RawResponse, Status> {
     let path = Path::join(Path::new("examples"), Path::join(Path::new("images"), "image(貓).jpg"));
 
-    RawResponse::from_file(path).await.map_err(|err| {
+    let response = RawResponse::from_file(path).await.map_err(|err| {
         if err.kind() == ErrorKind::NotFound {
             Status::NotFound
         } else {
             Status::InternalServerError
         }
+    })?;
+
+    Ok(match file_name {
+        Some(file_name) => response.file_name(file_name),
+        None => response,
     })
 }
 
@@ -216,14 +221,27 @@ fn file_with_a_name_taken_from_the_path() {
     assert_eq!(Some("image/jpeg"), response.headers().get_one("Content-Type"));
 }
 
-/// Rocket strips the extension from `TempFile::name`, so the response has to put it back.
 #[test]
-fn temp_file_keeps_its_extension() {
+fn renamed_file_uses_the_source_media_type() {
+    let client = client();
+
+    let response = client.get("/file?file_name=report.unknownext").dispatch();
+
+    assert_eq!(Status::Ok, response.status());
+    assert_eq!(
+        Some("inline; filename=\"report.unknownext\"; filename*=UTF-8''report.unknownext"),
+        response.headers().get_one("Content-Disposition")
+    );
+    assert_eq!(Some("image/jpeg"), response.headers().get_one("Content-Type"));
+}
+
+#[test]
+fn temp_file_keeps_its_extensions_without_the_client_path() {
     let client = client();
 
     let body = format!(
         "--{BOUNDARY}\r\nContent-Disposition: form-data; name=\"file\"; \
-         filename=\"report.pdf\"\r\nContent-Type: \
+         filename=\"C:\\fakepath\\report.final.pdf\"\r\nContent-Type: \
          application/pdf\r\n\r\n%PDF-1.4\r\n--{BOUNDARY}--\r\n"
     );
 
@@ -235,7 +253,7 @@ fn temp_file_keeps_its_extension() {
 
     assert_eq!(Status::Ok, response.status());
     assert_eq!(
-        Some("inline; filename=\"report.pdf\"; filename*=UTF-8''report.pdf"),
+        Some("inline; filename=\"report.final.pdf\"; filename*=UTF-8''report.final.pdf"),
         response.headers().get_one("Content-Disposition")
     );
     assert_eq!(Some("application/pdf"), response.headers().get_one("Content-Type"));
@@ -268,7 +286,8 @@ fn temp_file_uploaded_without_a_media_type() {
     assert_eq!(Some("application/pdf"), response.headers().get_one("Content-Type"));
 }
 
-/// A value field of a form arrives as a `TempFile` that is buffered in memory instead of stored on disk, and it carries neither a name nor a media type. Such a body is sent as plain bytes, so its length is left to the server to report just like the one of a `Vec<u8>`.
+/// A value field of a form arrives as a `TempFile` that is buffered in memory instead of stored on disk, and it carries neither a name nor a media type.
+/// Such a body is sent as plain bytes, so its length is left to the server to report just like the one of a `Vec<u8>`.
 #[test]
 fn buffered_temp_file() {
     let client = client();
